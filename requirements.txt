@@ -2,3 +2,9 @@ pytest
 pandas
 numpy
 flask
+streamlit
+fastapi
+uvicorn[standard]
+requests
+black
+flake8
