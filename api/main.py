@@ -3,16 +3,22 @@ FastAPI Application for Monetary Policy & Financial Resilience Engine.
 
 Exposes REST API endpoints for standalone policy stance analysis,
 integrated scenario simulation, and economic profile querying.
+This version offloads persistence to FastAPI BackgroundTasks and initializes
+the SQLAlchemy-backed storage on startup.
 """
 
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, BackgroundTasks, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from ai.policy_analyser import PolicyAnalyser
 from analysis.scenario_analysis import ScenarioEngine
 from models.resilience_model import ResilienceEngine
+
+from storage.db import init_db, SessionLocal
+from storage.models import PolicyAnalysisLog, ScenarioRunLog
+from sqlalchemy.orm import Session
 
 app = FastAPI(
     title="Monetary Policy & Resilience API",
@@ -72,6 +78,65 @@ class ScenarioRequest(BaseModel):
     )
 
 
+# ------------------ Startup & Background Tasks ------------------
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
+
+def log_analysis_task(statement_text: str, result: Dict[str, Any]):
+    """Background task to persist policy stance analysis."""
+    db: Session = SessionLocal()
+    try:
+        analysis = PolicyAnalysisLog(
+            raw_text=statement_text,
+            stance_label=result.get("stance_label", "Neutral"),
+            net_stance_score=result.get("net_stance_score", 50.0),
+            weighted_hawkish_score=result.get("weighted_hawkish_score", 0.0),
+            weighted_dovish_score=result.get("weighted_dovish_score", 0.0),
+            hawkish_signals=result.get("hawkish_signals_found", []),
+            dovish_signals=result.get("dovish_signals_found", []),
+        )
+        db.add(analysis)
+        db.commit()
+    finally:
+        db.close()
+
+
+def log_scenario_task(statement_text: str, payload_data: Dict[str, Any], results: Dict[str, Any]):
+    """Background task to persist both analysis and scenario run."""
+    db: Session = SessionLocal()
+    try:
+        analyser = PolicyAnalyser()
+        policy_result = analyser.analyze_statement(statement_text)
+
+        analysis = PolicyAnalysisLog(
+            raw_text=statement_text,
+            stance_label=policy_result.get("stance_label", "Neutral"),
+            net_stance_score=policy_result.get("net_stance_score", 50.0),
+            weighted_hawkish_score=policy_result.get("weighted_hawkish_score", 0.0),
+            weighted_dovish_score=policy_result.get("weighted_dovish_score", 0.0),
+            hawkish_signals=policy_result.get("hawkish_signals_found", []),
+            dovish_signals=policy_result.get("dovish_signals_found", []),
+        )
+        db.add(analysis)
+        db.commit()
+        db.refresh(analysis)
+
+        scenario_record = ScenarioRunLog(
+            policy_analysis_id=analysis.id,
+            repo_rate_change_bps=payload_data["repo_rate_change_bps"],
+            borrowing_transmission_factor=payload_data["borrowing_transmission_factor"],
+            deposit_transmission_factor=payload_data["deposit_transmission_factor"],
+            profile_impacts_summary=results.get("profile_impacts", {}),
+        )
+        db.add(scenario_record)
+        db.commit()
+    finally:
+        db.close()
+
+
 # ------------------ API Endpoints ------------------
 
 @app.get("/health", tags=["System"])
@@ -81,10 +146,10 @@ def health_check() -> Dict[str, str]:
 
 
 @app.post("/api/v1/analyze-stance", tags=["NLP Policy Analyser"]) 
-def analyze_policy_stance(payload: PolicyStanceRequest) -> Dict[str, Any]:
+def analyze_policy_stance(payload: PolicyStanceRequest, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     """
     Parses a policy statement, detects hawkish/dovish signals, handles negation,
-    and returns a weighted stance score (0-100).
+    and returns a weighted stance score (0-100). Persists analysis in background.
     """
     if not payload.statement_text.strip():
         raise HTTPException(
@@ -93,14 +158,19 @@ def analyze_policy_stance(payload: PolicyStanceRequest) -> Dict[str, Any]:
         )
 
     analyser = PolicyAnalyser(negation_window=payload.negation_window)
-    return analyser.analyze_statement(payload.statement_text)
+    result = analyser.analyze_statement(payload.statement_text)
+
+    # Offload DB write to background
+    background_tasks.add_task(log_analysis_task, payload.statement_text, result)
+    return result
 
 
 @app.post("/api/v1/run-scenario", tags=["Scenario Engine"]) 
-def run_integrated_scenario(payload: ScenarioRequest) -> Dict[str, Any]:
+def run_integrated_scenario(payload: ScenarioRequest, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     """
     Executes an end-to-end simulation combining policy stance scoring, interest rate
     transmission shocks, and financial resilience evaluation across economic profiles.
+    Persists results asynchronously.
     """
     if not payload.statement_text.strip():
         raise HTTPException(
@@ -108,12 +178,21 @@ def run_integrated_scenario(payload: ScenarioRequest) -> Dict[str, Any]:
             detail="statement_text cannot be empty.",
         )
 
-    return scenario_engine.run_scenario(
+    results = scenario_engine.run_scenario(
         statement_text=payload.statement_text,
         repo_rate_change_bps=payload.repo_rate_change_bps,
         borrowing_transmission_factor=payload.borrowing_transmission_factor,
         deposit_transmission_factor=payload.deposit_transmission_factor,
     )
+
+    # Offload DB write to background
+    background_tasks.add_task(
+        log_scenario_task,
+        payload.statement_text,
+        payload.dict(),
+        results,
+    )
+    return results
 
 
 @app.get("/api/v1/profiles", tags=["Resilience Engine"]) 
@@ -137,4 +216,5 @@ def list_default_profiles() -> Dict[str, Any]:
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
